@@ -6,16 +6,16 @@
     "entrypoint": "app"
   },
   "python": {
-    "version": "3.14.6",
+    "version": "3.11.9",
     "package_manager": {
       "name": "pip",
-      "version": "26.1.2",
+      "version": "24.0",
       "package_file": "requirements.txt"
     }
   },
   "files": {
     "requirements.txt": {
-      "checksum": "d763b2a3e63f4bba5317106a46232da0"
+      "checksum": "426e6ce05fbc5bd344e35fa5375cc2f8"
     },
     "app.py": {
       "checksum": "d1bde17197a6c98aa67adf82f664fd42"

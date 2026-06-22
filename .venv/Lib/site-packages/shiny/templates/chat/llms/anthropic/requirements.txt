@@ -1,0 +1,3 @@
+shiny
+python-dotenv
+chatlas[anthropic]
