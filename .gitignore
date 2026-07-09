@@ -1,0 +1,10 @@
+# Entorno virtual y caches de Python
+.venv/
+__pycache__/
+*.pyc
+
+# Configuración local de Claude Code
+.claude/
+
+# Artefactos de pytest
+.pytest_cache/
