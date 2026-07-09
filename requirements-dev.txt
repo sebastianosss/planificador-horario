@@ -1,0 +1,4 @@
+# Herramientas de desarrollo (no se despliegan a Posit Connect Cloud).
+-r requirements.txt
+pytest
+rsconnect-python==1.29.0
