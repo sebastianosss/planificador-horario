@@ -16,6 +16,8 @@ import pandas as pd
 import pulp
 import json
 import io
+import re
+import html as html_lib
 
 from reportlab.lib.pagesizes import landscape, A4
 from reportlab.lib import colors as rl_colors
@@ -44,6 +46,30 @@ CATEGORIAS = {
 }
 ORDEN_PALETA = ["L", "N", "R", "C", "D", ""]
 
+# Paleta de colores sugeridos para las asignaturas (hex -> nombre legible).
+COLORES_ASIG = [
+    ("#3b6fb6", "Azul"),        ("#8e44ad", "Morado"),
+    ("#c0392b", "Rojo"),        ("#16a085", "Verde azulado"),
+    ("#d35400", "Naranjo"),     ("#2c3e50", "Azul noche"),
+    ("#2980b9", "Celeste"),     ("#27ae60", "Verde"),
+    ("#e67e22", "Ámbar"),       ("#7f8c8d", "Gris"),
+]
+
+# Un identificador de asignatura tiene la forma "S1", "S2", ...
+RE_ASIG = re.compile(r"S\d+")
+
+
+def es_asignatura(code) -> bool:
+    return bool(RE_ASIG.fullmatch(str(code).strip()))
+
+
+def mapa_render(asignaturas: list) -> dict:
+    """Combina las categorías base con las asignaturas: code -> (etiqueta, bg, fg)."""
+    m = {code: (lbl, bg, fg) for code, (lbl, bg, fg) in CATEGORIAS.items()}
+    for a in asignaturas:
+        m[a["id"]] = (a["nombre"], a["color"], "#ffffff")
+    return m
+
 
 def filas_catalogo():
     """Fuente única de verdad: (inicio, fin, nombre, es_recreo)."""
@@ -58,13 +84,16 @@ def filas_catalogo():
         ("11:30", "12:15", "Bloque 5",         False),
         ("12:15", "13:00", "Bloque 6",         False),
         ("13:00", "14:00", "Bloque 6b",        False),
-        ("14:00", "15:00", "Bloque 7",         False),
-        ("15:00", "15:30", "Bloque 8",         False),
-        ("15:30", "16:30", "Bloque 9",         False),
-        ("16:30", "17:30", "Bloque 10",        False),
-        ("17:30", "18:30", "Bloque 11",        False),
-        ("18:30", "19:30", "Bloque 12",        False),
-        ("19:30", "20:30", "Bloque 13",        False),
+        # Jornada de tarde: dos bloques de 45', recreo, dos de 45', recreo,
+        # dos de 45'. (desde el regreso de almuerzo, 14:00)
+        ("14:00", "14:45", "Bloque 7",         False),
+        ("14:45", "15:30", "Bloque 8",         False),
+        ("15:30", "15:45", "Recreo 3",         True),
+        ("15:45", "16:30", "Bloque 9",         False),
+        ("16:30", "17:15", "Bloque 10",        False),
+        ("17:15", "17:30", "Recreo 4",         True),
+        ("17:30", "18:15", "Bloque 11",        False),
+        ("18:15", "19:00", "Bloque 12",        False),
     ]
 
 
@@ -130,6 +159,32 @@ def _solapa(a_ini, a_fin, b_ini, b_fin):
     if a_ini is None or a_fin is None or b_ini is None or b_fin is None:
         return 0
     return max(0, min(a_fin, b_fin) - max(a_ini, b_ini))
+
+
+def nominal_min(df: pd.DataFrame, i: int):
+    """Duración nominal (en minutos) del bloque de la fila i, según Inicio/Fin."""
+    ini = time_to_mins(df.at[i, "Inicio"])
+    fin = time_to_mins(df.at[i, "Fin"])
+    if ini is None or fin is None or fin <= ini:
+        return None
+    return fin - ini
+
+
+def minutos_celda(df: pd.DataFrame, dur_df: pd.DataFrame, i: int, d: str) -> int:
+    """
+    Minutos EFECTIVOS que aporta la celda (i, d): lo que realmente cae dentro
+    de la jornada. Solo cae a la duración nominal del bloque si no hay dato de
+    duración (celda desconocida / NaN); un 0 explícito se respeta como 0.
+    Fuente única de verdad usada por el optimizador, la validación y los tooltips.
+    """
+    try:
+        v = float(dur_df.at[i, d])
+    except (KeyError, TypeError, ValueError):
+        v = None
+    if v is None or v != v:  # None o NaN
+        nb = nominal_min(df, i)
+        v = nb if nb is not None else 0
+    return max(0, int(round(v)))
 
 
 # -----------------------------------------------------------------------------
@@ -217,12 +272,37 @@ def construir_esqueleto_pure(horarios_por_dia: dict) -> tuple[pd.DataFrame, pd.D
 
 def aplicar_pintura(df: pd.DataFrame, row: int, day: str, value: str) -> pd.DataFrame:
     value = (value or "").strip().upper()
-    if value not in CATEGORIAS:
+    if value not in CATEGORIAS and not es_asignatura(value):
         return df
     if day not in DIAS or not (0 <= row < len(df)):
         return df
     df = df.copy()
     df.at[row, day] = value
+    return df
+
+
+def fusionar_pintura(nuevo_df: pd.DataFrame, viejo_df) -> pd.DataFrame:
+    """
+    Al re-aplicar el horario de contrato, repone sobre el nuevo esqueleto las
+    marcas que el usuario ya había pintado (clases, no lectiva y asignaturas),
+    siempre que caigan en un bloque que sigue siendo tiempo de trabajo ('D')
+    en el nuevo esqueleto. Así, corregir un día no obliga a re-pintar la semana.
+    """
+    if viejo_df is None:
+        return nuevo_df
+    df = nuevo_df.copy()
+    for d in DIAS:
+        if d not in viejo_df.columns:
+            continue
+        for i in range(len(df)):
+            if str(df.at[i, d]).strip() != "D":
+                continue  # solo repongo sobre tiempo disponible del nuevo esqueleto
+            try:
+                viejo = str(viejo_df.at[i, d]).strip()
+            except (KeyError, IndexError):
+                continue
+            if viejo in ("L", "N") or es_asignatura(viejo):
+                df.at[i, d] = viejo
     return df
 
 
@@ -268,15 +348,8 @@ def optimizar(df: pd.DataFrame, dur_df: pd.DataFrame, horas_contrato: float):
             nominal[i], start[i] = fin - ini, ini
 
     def minutos(i, d):
-        """Minutos efectivos de la celda; si no hay dato, cae a la duración nominal."""
-        try:
-            v = dur_df.at[i, d]
-            v = float(v)
-        except (KeyError, TypeError, ValueError):
-            v = None
-        if v is None or v != v:  # NaN
-            v = nominal[i] or 0
-        return max(0, int(round(v)))
+        """Minutos efectivos de la celda (fuente única: minutos_celda)."""
+        return minutos_celda(df, dur_df, i, d)
 
     lectiva = nolectiva = recreo_min = col_min = 0
     cand = []
@@ -290,7 +363,8 @@ def optimizar(df: pd.DataFrame, dur_df: pd.DataFrame, horas_contrato: float):
             m = minutos(i, d)
             if m <= 0:
                 continue
-            if c == "L":
+            if c == "L" or es_asignatura(c):
+                # Una asignatura concreta (S1, S2, ...) es tiempo lectivo.
                 lectiva += m
                 work_starts[d].append(start[i])
             elif c == "N":
@@ -310,6 +384,7 @@ def optimizar(df: pd.DataFrame, dur_df: pd.DataFrame, horas_contrato: float):
 
     res = df.copy()
     prep_min = 0
+    n_prep = 0
     status = "ok"
 
     if fijo >= contract:
@@ -335,14 +410,24 @@ def optimizar(df: pd.DataFrame, dur_df: pd.DataFrame, horas_contrato: float):
             if val is not None and val > 0.5:
                 res.at[i, d] = "P"
                 prep_min += minutos(i, d)
+                n_prep += 1
 
     total = lectiva + nolectiva + recreo_min + prep_min
     deficit = max(0, contract - total)
+
+    # Tiempo Disponible dentro de la jornada que NO se pudo convertir en
+    # preparación porque el contrato ya está completo: la jornada del paso 1
+    # tiene más horas de las contratadas.
+    disponible = sum(minutos(i, d) for (i, d) in cand)
+    sobrante = disponible - prep_min
+    sobrante_bloques = len(cand) - n_prep
 
     resumen = {
         "contract": contract, "lectiva": lectiva, "nolectiva": nolectiva,
         "prep": prep_min, "recreo": recreo_min, "colacion": col_min,
         "total": total, "deficit": deficit, "status": status,
+        "disponible": disponible, "sobrante": sobrante,
+        "sobrante_bloques": sobrante_bloques,
     }
     return res, resumen
 
@@ -356,10 +441,10 @@ CATS_JS = json.dumps({code: {"label": lbl, "bg": bg, "fg": fg}
 
 SCRIPT_COMPARTIDO = ui.tags.script(f"""
 const CATS = {CATS_JS};
-window.currentPen = 'L';
+window.currentPen = {{code: 'L', bg: '#3b6fb6', fg: '#ffffff', mark: 'L'}};
 
-function setPen(code, btn) {{
-  window.currentPen = code;
+function setPen(code, bg, fg, mark, btn) {{
+  window.currentPen = {{code: code, bg: bg, fg: fg, mark: mark}};
   document.querySelectorAll('.pen-btn').forEach(function(b) {{
     b.style.outline = 'none'; b.style.boxShadow = 'none';
   }});
@@ -369,13 +454,13 @@ function setPen(code, btn) {{
 
 function paintCell(td) {{
   var pen = window.currentPen;
-  var meta = CATS[pen];
-  if (!meta) return;
-  td.style.background = meta.bg;
-  td.style.color = meta.fg;
-  td.textContent = pen === '' ? '\\u00b7' : pen;
+  if (!pen) return;
+  td.style.background = pen.bg;
+  td.style.color = pen.fg;
+  td.textContent = (pen.mark === '' || pen.mark == null) ? '\\u00b7' : pen.mark;
+  td.title = pen.mark;
   Shiny.setInputValue('cell_paint', {{
-    row: td.dataset.row, day: td.dataset.day, value: pen, t: Date.now()
+    row: td.dataset.row, day: td.dataset.day, value: pen.code, t: Date.now()
   }}, {{priority: 'event'}});
 }}
 
@@ -391,32 +476,49 @@ function labelKeydown(ev, inp) {{
 """)
 
 
-def paleta_html() -> str:
-    chips = []
-    for code in ORDEN_PALETA:
-        label, bg, fg = CATEGORIAS[code]
-        activo = "outline:3px solid #1f2d3d;box-shadow:0 0 0 2px #fff inset;" if code == "L" else ""
-        chips.append(
-            f'<button type="button" class="pen-btn" data-code="{code}" '
-            f'onclick="setPen(\'{code}\', this)" '
-            f'style="background:{bg};color:{fg};border:none;{activo}'
+def _chip_pen(code, label, bg, fg, activo=False) -> str:
+    """Un botón de la paleta. Para categorías la marca es su letra; para
+    asignaturas, su nombre."""
+    if code in CATEGORIAS:
+        mark = code if code else "·"
+    else:
+        mark = label
+    args = ", ".join(json.dumps(x) for x in (code, bg, fg, mark))
+    onclick = html_lib.escape(f"setPen({args}, this)", quote=True)
+    act = ("outline:3px solid #1f2d3d;box-shadow:0 0 0 2px #fff inset;"
+           if activo else "")
+    return (f'<button type="button" class="pen-btn" '
+            f'onclick="{onclick}" '
+            f'style="background:{bg};color:{fg};border:none;{act}'
             f'padding:9px 16px;border-radius:9px;font-weight:700;font-size:13px;'
-            f'cursor:pointer;margin:3px;">{label}</button>'
-        )
-    return ('<div style="margin:4px 0 10px 0;">' + "".join(chips) +
-            '</div><div style="font-size:12px;color:#7a8a99;margin-bottom:8px;">'
-            'Elige una categoría y luego haz clic sobre los bloques de la grilla '
-            'para pintarlos.</div>')
+            f'cursor:pointer;margin:3px;">{html_lib.escape(label)}</button>')
+
+
+def paleta_html(asignaturas: list) -> str:
+    chips = [_chip_pen("L", "Lectiva (genérica)",
+                       CATEGORIAS["L"][1], CATEGORIAS["L"][2],
+                       activo=not asignaturas)]
+    for a in asignaturas:
+        chips.append(_chip_pen(a["id"], a["nombre"], a["color"], "#ffffff"))
+    for code in ["N", "R", "C", "D", ""]:
+        label, bg, fg = CATEGORIAS[code]
+        chips.append(_chip_pen(code, label, bg, fg))
+    aviso = ('<div style="font-size:12px;color:#7a8a99;margin-bottom:8px;">'
+             'Elige una asignatura (o categoría) y haz clic sobre los bloques de '
+             'la grilla para pintarlos. Puedes repintar un bloque cuando quieras.'
+             '</div>')
+    return '<div style="margin:4px 0 10px 0;">' + "".join(chips) + '</div>' + aviso
 
 
 # -----------------------------------------------------------------------------
 # 7. GRILLA PINTABLE  (paso 2)
 # -----------------------------------------------------------------------------
 
-def grilla_pintable_html(df: pd.DataFrame) -> str:
+def grilla_pintable_html(df: pd.DataFrame, mapa: dict, dur_df=None) -> str:
     cell_css = ("padding:8px 4px;text-align:center;font-weight:700;"
-                "font-size:13px;border:1px solid #ffffff;border-radius:5px;"
-                "cursor:pointer;user-select:none;transition:transform .05s;")
+                "font-size:12px;border:1px solid #ffffff;border-radius:5px;"
+                "cursor:pointer;user-select:none;transition:transform .05s;"
+                "word-break:break-word;line-height:1.15;")
     head_css = ("padding:6px 8px;text-align:left;font-size:12px;"
                 "color:#5b6b7b;font-weight:600;border-bottom:2px solid #e3e8ee;")
 
@@ -434,13 +536,23 @@ def grilla_pintable_html(df: pd.DataFrame) -> str:
         html.append("<tr>")
         html.append(f'<td style="{head_css}white-space:nowrap;">{etiqueta}</td>')
         for d in DIAS:
-            code = str(df.at[i, d]).strip().upper()
-            if code not in CATEGORIAS:
+            code = str(df.at[i, d]).strip()
+            if code not in mapa:
                 code = ""
-            label, bg, fg = CATEGORIAS[code]
-            txt = "·" if code == "" else code
+            label, bg, fg = mapa[code]
+            if code == "":
+                txt = "·"
+            elif code in CATEGORIAS:
+                txt = code
+            else:
+                txt = html_lib.escape(label)
+            tip = label
+            if dur_df is not None and code != "":
+                eff = minutos_celda(df, dur_df, i, d)
+                tip = f"{label} · aporta {eff} min"
             html.append(
-                f'<td title="{label}" data-row="{i}" data-day="{d}" onclick="paintCell(this)" '
+                f'<td title="{html_lib.escape(tip)}" data-row="{i}" data-day="{d}" '
+                f'onclick="paintCell(this)" '
                 f'style="{cell_css}background:{bg};color:{fg};">{txt}</td>'
             )
         html.append("</tr>")
@@ -452,8 +564,9 @@ def grilla_pintable_html(df: pd.DataFrame) -> str:
 # 8. GRILLA DE RESULTADO CON ETIQUETAS  (paso 3)
 # -----------------------------------------------------------------------------
 
-def grilla_resultado_html(res: pd.DataFrame, labels: dict) -> str:
-    cell_css = "padding:3px;border:1px solid #ffffff;border-radius:5px;"
+def grilla_resultado_html(res: pd.DataFrame, labels: dict, mapa: dict, dur_df=None) -> str:
+    cell_css = ("padding:3px;border:1px solid #ffffff;border-radius:5px;"
+                "position:relative;")
     head_css = ("padding:6px 8px;text-align:left;font-size:12px;"
                 "color:#5b6b7b;font-weight:600;border-bottom:2px solid #e3e8ee;")
     input_css = ("width:100%;border:none;background:transparent;font-size:11px;"
@@ -473,17 +586,46 @@ def grilla_resultado_html(res: pd.DataFrame, labels: dict) -> str:
         html.append("<tr>")
         html.append(f'<td style="{head_css}white-space:nowrap;">{etiqueta}</td>')
         for d in DIAS:
-            code = str(res.at[i, d]).strip().upper()
-            if code not in CATEGORIAS or code == "":
+            code = str(res.at[i, d]).strip()
+            if code not in mapa or code == "":
                 html.append(f'<td style="{cell_css}background:#fbfcfd;"></td>')
                 continue
-            cat_label, bg, fg = CATEGORIAS[code]
+            cat_label, bg, fg = mapa[code]
             key = f"{i}_{d}"
-            valor = labels.get(key, "" if code in ("L", "N", "P") else cat_label)
-            placeholder = cat_label if code in ("L", "N", "P") else ""
+            es_asig = es_asignatura(code)
+            if es_asig:
+                # La asignatura ya trae su nombre; el detalle es opcional.
+                valor = labels.get(key, cat_label)
+                placeholder = ""
+            elif code in ("L", "N", "P"):
+                valor = labels.get(key, "")
+                placeholder = cat_label
+            else:
+                valor = labels.get(key, cat_label)
+                placeholder = ""
+            valor = html_lib.escape(str(valor), quote=True)
+            placeholder = html_lib.escape(str(placeholder), quote=True)
+
+            # Minutos efectivos que aporta esta celda + distintivo si es parcial.
+            eff = minutos_celda(res, dur_df, i, d) if dur_df is not None else None
+            nomi = nominal_min(res, i)
+            badge = ""
+            tip = f"{cat_label}"
+            if eff is not None:
+                tip = f"{cat_label} · aporta {eff} min al total"
+                if nomi is not None and eff != nomi:
+                    # El bloque no aporta su duración completa (ej. salida 14:15).
+                    col = "#b45309" if eff > 0 else "#b71c1c"
+                    badge = (f'<span title="{html_lib.escape(tip)}" '
+                             f'style="position:absolute;top:1px;right:3px;font-size:9px;'
+                             f'font-weight:800;color:{col};background:#fff7ed;'
+                             f'border:1px solid {col};border-radius:4px;padding:0 3px;'
+                             f'line-height:1.3;pointer-events:none;">{eff}m</span>')
+            tip = html_lib.escape(tip, quote=True)
             html.append(
-                f'<td style="{cell_css}background:{bg};">'
+                f'<td title="{tip}" style="{cell_css}background:{bg};">{badge}'
                 f'<input type="text" value="{valor}" placeholder="{placeholder}" '
+                f'title="{tip}" '
                 f'data-row="{i}" data-day="{d}" onblur="saveLabel(this)" '
                 f'onkeydown="labelKeydown(event,this)" '
                 f'style="{input_css}color:{fg};"></td>'
@@ -544,6 +686,13 @@ def resumen_html(r: dict) -> str:
     elif r["status"] == "sin_espacio":
         avisos.append(("#fff8e1", "#8a6d00",
                        "No hay bloques marcados como Disponibles; no se pudo asignar preparación."))
+    if r.get("sobrante", 0) > 0:
+        avisos.append(("#fdecea", "#b71c1c",
+                       f"Tu jornada tiene más tiempo del que exige el contrato: quedaron "
+                       f"{r.get('sobrante_bloques', 0)} bloques Disponibles "
+                       f"({fmt_horas(r['sobrante'])}) sin asignar después de optimizar. "
+                       "Si no corresponde, recorta el horario del paso 1 o corrige las "
+                       "horas de contrato."))
     if r["deficit"] > 0 and r["status"] == "ok":
         avisos.append(("#fff8e1", "#8a6d00",
                        f"Faltan {fmt_horas(r['deficit'])} para llegar al contrato: no hay "
@@ -569,10 +718,162 @@ def resumen_html(r: dict) -> str:
 
 
 # -----------------------------------------------------------------------------
+# 8b. TABLA DE SUMA DE HORAS  (desglose por día + bloques nuevos de preparación)
+# -----------------------------------------------------------------------------
+
+def desglose_horas(res: pd.DataFrame, dur_df: pd.DataFrame) -> dict:
+    """
+    Minutos por categoría y día del horario resultante. "L" agrupa la lectiva
+    genérica y las asignaturas (S1, S2, ...). Solo suma minutos efectivos
+    (minutos_celda), igual que el optimizador y el resumen.
+    """
+    out = {c: {d: 0 for d in DIAS} for c in ("L", "N", "P", "R")}
+    for i in range(len(res)):
+        for d in DIAS:
+            c = str(res.at[i, d]).strip().upper()
+            if not c:
+                continue
+            m = minutos_celda(res, dur_df, i, d)
+            if m <= 0:
+                continue
+            if c == "L" or es_asignatura(c):
+                out["L"][d] += m
+            elif c in ("N", "P", "R"):
+                out[c][d] += m
+    return out
+
+
+def bloques_preparacion(res: pd.DataFrame, dur_df: pd.DataFrame) -> list:
+    """
+    Los bloques "P" del resultado (los que agrega la optimización), agrupados
+    por día y en orden cronológico: dónde quedaron y cuántos minutos aportan.
+    """
+    out = []
+    for d in DIAS:
+        for i in range(len(res)):
+            if str(res.at[i, d]).strip().upper() != "P":
+                continue
+            out.append({
+                "dia": d,
+                "bloque": str(res.at[i, "Bloque"]),
+                "horario": f"{res.at[i, 'Inicio']}–{res.at[i, 'Fin']}",
+                "min": minutos_celda(res, dur_df, i, d),
+            })
+    return out
+
+
+def tabla_horas_html(res: pd.DataFrame, dur_df: pd.DataFrame) -> str:
+    des = desglose_horas(res, dur_df)
+    prep = bloques_preparacion(res, dur_df)
+
+    head_css = ("padding:6px 8px;font-size:12px;color:#5b6b7b;font-weight:600;"
+                "border-bottom:2px solid #e3e8ee;text-align:center;")
+    cell_css = "padding:5px 8px;font-size:12px;text-align:center;color:#37474f;"
+    title_css = ("font-size:12px;color:#7a8a99;text-transform:uppercase;"
+                 "letter-spacing:.04em;margin:0 0 6px 0;")
+
+    def celda(mins, bold=False):
+        txt = fmt_horas(mins) if mins > 0 else "—"
+        peso = "font-weight:700;" if bold else ""
+        return f'<td style="{cell_css}{peso}">{txt}</td>'
+
+    # --- A. Desglose de la suma por día y categoría --------------------------
+    filas_cat = [
+        ("L", "Lectiva (clases y asignaturas)"),
+        ("N", "No lectiva asignada por ti"),
+        ("P", "Preparación (bloques nuevos)"),
+        ("R", "Recreo"),
+    ]
+    a = ['<table style="border-collapse:collapse;width:100%;'
+         'font-family:system-ui,sans-serif;">']
+    a.append(f'<tr><th style="{head_css}text-align:left;">Categoría</th>')
+    for d in DIAS:
+        a.append(f'<th style="{head_css}">{DIAS_NOMBRE[d]}</th>')
+    a.append(f'<th style="{head_css}">Semana</th></tr>')
+
+    tot_dia = {d: 0 for d in DIAS}
+    for code, nombre in filas_cat:
+        _, bg, _ = CATEGORIAS[code]
+        chip = (f'<span style="display:inline-block;width:12px;height:12px;'
+                f'border-radius:3px;background:{bg};margin-right:6px;'
+                f'vertical-align:-1px;"></span>')
+        a.append(f'<tr><td style="{cell_css}text-align:left;">{chip}{nombre}</td>')
+        tot_cat = 0
+        for d in DIAS:
+            m = des[code][d]
+            tot_cat += m
+            tot_dia[d] += m
+            a.append(celda(m))
+        a.append(celda(tot_cat, bold=True) + "</tr>")
+
+    a.append(f'<tr style="border-top:2px solid #e3e8ee;">'
+             f'<td style="{cell_css}text-align:left;font-weight:700;">Total trabajado</td>')
+    for d in DIAS:
+        a.append(celda(tot_dia[d], bold=True))
+    a.append(celda(sum(tot_dia.values()), bold=True) + "</tr></table>")
+    tabla_desglose = "".join(a)
+
+    # --- B. Dónde quedaron los bloques nuevos (Preparación) ------------------
+    if not prep:
+        tabla_prep = ('<div style="font-size:13px;color:#9aa7b3;">La optimización '
+                      'no agregó bloques nuevos de preparación.</div>')
+    else:
+        b = ['<table style="border-collapse:collapse;width:100%;'
+             'font-family:system-ui,sans-serif;">']
+        b.append(f'<tr><th style="{head_css}text-align:left;">Día</th>'
+                 f'<th style="{head_css}text-align:left;">Bloque</th>'
+                 f'<th style="{head_css}">Horario</th>'
+                 f'<th style="{head_css}">Aporta</th></tr>')
+        dia_prev = None
+        for p in prep:
+            dia_txt = DIAS_NOMBRE[p["dia"]] if p["dia"] != dia_prev else ""
+            dia_prev = p["dia"]
+            borde = ("border-top:1px solid #e3e8ee;" if dia_txt else "")
+            b.append(
+                f'<tr><td style="{cell_css}{borde}text-align:left;font-weight:700;">'
+                f'{dia_txt}</td>'
+                f'<td style="{cell_css}{borde}text-align:left;">{p["bloque"]}</td>'
+                f'<td style="{cell_css}{borde}">{p["horario"]}</td>'
+                f'<td style="{cell_css}{borde}font-weight:600;">{p["min"]} min</td></tr>'
+            )
+        total_prep = sum(p["min"] for p in prep)
+        b.append(f'<tr style="border-top:2px solid #e3e8ee;">'
+                 f'<td colspan="3" style="{cell_css}text-align:left;font-weight:700;">'
+                 f'Total: {len(prep)} bloques nuevos</td>'
+                 f'<td style="{cell_css}font-weight:700;">{fmt_horas(total_prep)}</td>'
+                 f'</tr></table>')
+        tabla_prep = "".join(b)
+
+    nota = ('<div style="font-size:11px;color:#9aa7b3;margin-top:8px;">'
+            'La colación no suma horas. El recreo suma al total trabajado pero no '
+            'entra en la proporción 65/35 lectiva/no lectiva.</div>')
+
+    # Todo el detalle va plegado en un <details>: no alarga la página y se
+    # expande con un clic cuando el usuario quiere verificar la suma.
+    summary = (
+        '<summary style="cursor:pointer;font-size:13px;font-weight:600;color:#445;'
+        'user-select:none;">Detalle de la suma de horas y bloques nuevos '
+        '<span style="font-weight:400;color:#7a8a99;">(clic para ver/ocultar)</span>'
+        '</summary>'
+    )
+    return (
+        '<details style="background:#f8fafc;border:1px solid #e3e8ee;border-radius:10px;'
+        'padding:12px 14px;margin-top:12px;">'
+        + summary +
+        f'<div style="{title_css}margin-top:12px;">Suma de horas por día</div>'
+        + tabla_desglose +
+        f'<div style="{title_css}margin-top:14px;">Bloques nuevos de preparación '
+        '(agregados por la optimización)</div>'
+        + tabla_prep + nota + '</details>'
+    )
+
+
+# -----------------------------------------------------------------------------
 # 9. GENERACIÓN DE PDF IMPRIMIBLE
 # -----------------------------------------------------------------------------
 
-def generar_pdf(res: pd.DataFrame, labels: dict, resumen: dict, titulo: str = "Horario semanal") -> bytes:
+def generar_pdf(res: pd.DataFrame, labels: dict, resumen: dict, mapa: dict,
+                titulo: str = "Horario semanal") -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(A4),
@@ -593,12 +894,15 @@ def generar_pdf(res: pd.DataFrame, labels: dict, resumen: dict, titulo: str = "H
         ini, fin, nom = res.at[i, "Inicio"], res.at[i, "Fin"], res.at[i, "Bloque"]
         fila = [f"{ini}–{fin} {nom}"]
         for d in DIAS:
-            code = str(res.at[i, d]).strip().upper()
-            if code == "" or code not in CATEGORIAS:
+            code = str(res.at[i, d]).strip()
+            if code == "" or code not in mapa:
                 fila.append("")
                 continue
-            cat_label = CATEGORIAS[code][0]
-            texto = labels.get(f"{i}_{d}", "").strip() or (cat_label if code != "L" and code != "N" else "")
+            cat_label = mapa[code][0]
+            # Para lectiva/no lectiva genéricas el nombre no aporta; para
+            # asignaturas y el resto se muestra la etiqueta por defecto.
+            defecto = "" if code in ("L", "N") else cat_label
+            texto = labels.get(f"{i}_{d}", "").strip() or defecto
             fila.append(texto)
         data.append(fila)
 
@@ -622,10 +926,10 @@ def generar_pdf(res: pd.DataFrame, labels: dict, resumen: dict, titulo: str = "H
     ]
     for i in range(len(res)):
         for j, d in enumerate(DIAS, start=1):
-            code = str(res.at[i, d]).strip().upper()
-            if code not in CATEGORIAS:
+            code = str(res.at[i, d]).strip()
+            if code not in mapa:
                 code = ""
-            _, bg, fg = CATEGORIAS[code]
+            _, bg, fg = mapa[code]
             estilo.append(("BACKGROUND", (j, i + 1), (j, i + 1), rl_colors.HexColor(bg)))
             estilo.append(("TEXTCOLOR", (j, i + 1), (j, i + 1), rl_colors.HexColor(fg)))
     tabla.setStyle(TableStyle(estilo))
@@ -668,15 +972,16 @@ def dia_wizard_ui(d):
         ui.panel_conditional(
             f"input.trabaja_{d}",
             ui.div(
-                ui.div(ui.input_select(f"ingreso_{d}", "Ingreso", OPCIONES_HORA,
-                                       selected="07:55", width="115px")),
+                ui.div(ui.input_text(f"ingreso_{d}", "Ingreso", value="07:55",
+                                     placeholder="HH:MM", width="115px")),
                 ui.panel_conditional(
                     f"input.colacion_{d}",
                     ui.div(
-                        ui.div(ui.input_select(f"salida_alm_{d}", "Salida (almuerzo)",
-                                               OPCIONES_HORA, selected="13:00", width="150px")),
-                        ui.div(ui.input_select(f"regreso_{d}", "Regreso", OPCIONES_HORA,
-                                               selected="14:00", width="115px")),
+                        ui.div(ui.input_text(f"salida_alm_{d}", "Salida (almuerzo)",
+                                             value="13:00", placeholder="HH:MM",
+                                             width="150px")),
+                        ui.div(ui.input_text(f"regreso_{d}", "Regreso", value="14:00",
+                                             placeholder="HH:MM", width="115px")),
                         style="display:flex;gap:14px;",
                     ),
                 ),
@@ -695,17 +1000,27 @@ def dia_wizard_ui(d):
 
 INSTRUCCIONES_PASO1 = ui.HTML(
     '<div style="font-size:13px;color:#445;line-height:1.5;margin-bottom:10px;">'
-    'Ingresa tu horario tal como aparece en tu contrato. Si un día no tiene '
-    'colación, desactiva "Tiene colación" y solo verás Ingreso/Salida. Si tu '
-    'semana se repite, configura el primer día y usa "Copiar a los demás días".'
-    '</div>'
+    'Escribe cada hora en formato <b>HH:MM</b> (24h), incluida la de ingreso. Si '
+    'un día no tiene colación, desactiva "Tiene colación" y solo verás '
+    'Ingreso/Salida. Si tu semana se repite, configura el primer día y usa '
+    '"Copiar a los demás días". Puedes <b>corregir un solo día y volver a aplicar</b>: '
+    'lo que ya hayas pintado en el resto de la semana se conserva.</div>'
+)
+
+INSTRUCCIONES_ASIG = ui.HTML(
+    '<div style="font-size:13px;color:#445;line-height:1.5;margin-bottom:10px;">'
+    'Registra cada asignatura o curso que dicta el profesor, con cuántos '
+    '<b>bloques por semana</b> le corresponden y un color para reconocerla en la '
+    'grilla. Luego, en el paso siguiente, la pintas sobre los bloques y la app te '
+    'avisa cuántos te faltan o te sobran.</div>'
 )
 
 INSTRUCCIONES_PASO2 = ui.HTML(
     '<div style="font-size:13px;color:#445;line-height:1.5;margin-bottom:4px;">'
     'Esta grilla ya viene marcada con tu jornada, colación y recreos. Ahora marca '
-    'tus clases (<b>Lectiva</b>) y compromisos fijos (<b>No lectiva</b>): elige la '
-    'categoría en la paleta y haz clic sobre los bloques. Lo que dejes en '
+    'tus clases eligiendo la <b>asignatura</b> en la paleta (o <b>Lectiva</b> '
+    'genérica) y los compromisos fijos como <b>No lectiva</b>; haz clic sobre los '
+    'bloques. Puedes repintar cualquier bloque para corregirlo. Lo que dejes en '
     '<b>Disponible</b> se completará al optimizar.</div>'
 )
 
@@ -713,6 +1028,9 @@ INSTRUCCIONES_PASO3 = ui.HTML(
     '<div style="font-size:13px;color:#445;line-height:1.5;margin-bottom:4px;">'
     'Escribe el detalle de cada bloque (ej. "Matemáticas 8°A", "Reunión de '
     'apoderados"). El cambio se guarda automáticamente al salir del casillero. '
+    '<b>Pasa el cursor sobre un bloque</b> para ver cuántos minutos aporta al '
+    'total; los bloques que aportan <b>menos</b> que su duración (por una salida a '
+    'mitad de bloque) muestran un distintivo naranjo con los minutos reales. '
     'Cuando esté listo, descarga el PDF imprimible.</div>'
 )
 
@@ -750,21 +1068,44 @@ app_ui = ui.page_sidebar(
         ui.output_ui("errores_wizard"),
     ),
     ui.card(
-        ui.card_header("2 · Marca tus bloques"),
+        ui.card_header("2 · Asignaturas del profesor"),
+        INSTRUCCIONES_ASIG,
+        ui.div(
+            ui.input_text("asig_nombre", "Nombre", placeholder="Ej: Matemáticas 8°A",
+                          width="230px"),
+            ui.input_numeric("asig_horas", "Bloques/semana", value=6, min=1, max=40,
+                             step=1, width="140px"),
+            ui.input_select("asig_color", "Color",
+                            {hexc: nom for hexc, nom in COLORES_ASIG}, width="150px"),
+            ui.input_action_button("asig_add", "Agregar", class_="btn-primary"),
+            style="display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin-bottom:10px;",
+        ),
+        ui.output_ui("lista_asig"),
+        ui.div(
+            ui.input_select("asig_del", "Quitar asignatura", {}, width="230px"),
+            ui.input_action_button("asig_remove", "Quitar seleccionada",
+                                   class_="btn-outline-secondary"),
+            style="display:flex;gap:10px;align-items:end;margin-top:8px;",
+        ),
+    ),
+    ui.card(
+        ui.card_header("3 · Marca tus bloques"),
         INSTRUCCIONES_PASO2,
-        ui.HTML(paleta_html()),
+        ui.output_ui("paleta_ui"),
         ui.output_ui("grilla_edit"),
+        ui.output_ui("validacion_asig"),
         ui.div(
             ui.input_action_button("optimizar", "Optimizar horario", class_="btn-primary"),
             style="margin-top:12px;",
         ),
     ),
     ui.card(
-        ui.card_header("3 · Horario optimizado — agrega el detalle"),
+        ui.card_header("4 · Horario optimizado — agrega el detalle"),
         INSTRUCCIONES_PASO3,
         ui.output_ui("leyenda_resultado"),
         ui.output_ui("grilla_resultado"),
         ui.output_ui("resumen_semana"),
+        ui.output_ui("tabla_horas"),
         ui.div(
             ui.download_button("descargar_pdf", "Descargar PDF", class_="btn-primary"),
             style="margin-top:12px;",
@@ -782,12 +1123,14 @@ app_ui = ui.page_sidebar(
 
 def server(input, output, session):
 
-    grid_state = reactive.value(catalogo_vacio())             # códigos L/N/R/C/D
+    grid_state = reactive.value(catalogo_vacio())             # códigos L/N/R/C/D o S#
     dur_state = reactive.value(catalogo_vacio_duraciones())   # minutos efectivos por celda
     grid_version = reactive.value(0)                # fuerza re-render de la grilla 2
     labels_rv = reactive.value({})                  # etiquetas del horario final
     resultado_rv = reactive.value(None)             # (df_resultado, resumen)
     errores_rv = reactive.value([])
+    asig_state = reactive.value([])                 # asignaturas: {id, nombre, color, horas}
+    asig_counter = reactive.value(0)                # correlativo para los ids S#
 
     # --- 1. Asistente de horario por contrato -------------------------------
 
@@ -806,9 +1149,9 @@ def server(input, output, session):
                 continue
             ui.update_checkbox(f"trabaja_{d}", value=trabaja)
             ui.update_checkbox(f"colacion_{d}", value=colacion)
-            ui.update_select(f"ingreso_{d}", selected=ingreso)
-            ui.update_select(f"salida_alm_{d}", selected=salida_alm)
-            ui.update_select(f"regreso_{d}", selected=regreso)
+            ui.update_text(f"ingreso_{d}", value=ingreso)
+            ui.update_text(f"salida_alm_{d}", value=salida_alm)
+            ui.update_text(f"regreso_{d}", value=regreso)
             ui.update_text(f"salida_{d}", value=salida)
 
     @reactive.effect
@@ -825,12 +1168,14 @@ def server(input, output, session):
                 "salida": input[f"salida_{d}"](),
             }
         df, dur, errores = construir_esqueleto_pure(horarios)
+        # Preserva lo ya pintado (clases/no lectiva/asignaturas) donde siga
+        # habiendo tiempo de trabajo: corregir un día no borra la semana.
+        df = fusionar_pintura(df, grid_state.get())
         grid_state.set(df)
         dur_state.set(dur)
         grid_version.set(grid_version.get() + 1)
         errores_rv.set(errores)
-        labels_rv.set({})
-        resultado_rv.set(None)
+        resultado_rv.set(None)  # la optimización previa queda obsoleta
 
     @render.ui
     def errores_wizard():
@@ -854,15 +1199,24 @@ def server(input, output, session):
         labels_rv.set({})
         resultado_rv.set(None)
         errores_rv.set([])
+        asig_state.set([])
+        asig_counter.set(0)
 
     # --- 2. Grilla pintable ---------------------------------------------------
 
     @render.ui
+    def paleta_ui():
+        return ui.HTML(paleta_html(asig_state.get()))
+
+    @render.ui
     def grilla_edit():
-        grid_version.get()  # única dependencia explícita de re-render
+        grid_version.get()   # dependencias explícitas de re-render
+        asig_state.get()     # re-render al agregar/quitar asignaturas (colores)
         with reactive.isolate():
             df = grid_state.get()
-        return ui.HTML(grilla_pintable_html(df))
+            dur = dur_state.get()
+            mapa = mapa_render(asig_state.get())
+        return ui.HTML(grilla_pintable_html(df, mapa, dur))
 
     @reactive.effect
     @reactive.event(input.cell_paint)
@@ -873,6 +1227,107 @@ def server(input, output, session):
         value = info["value"]
         df = grid_state.get()
         grid_state.set(aplicar_pintura(df, row, day, value))
+
+    # --- 2b. Asignaturas ------------------------------------------------------
+
+    @reactive.effect
+    @reactive.event(input.asig_add)
+    def _asig_add():
+        nombre = (input.asig_nombre() or "").strip()
+        if not nombre:
+            return
+        n = asig_counter.get() + 1
+        asig_counter.set(n)
+        nueva = {
+            "id": f"S{n}",
+            "nombre": nombre,
+            "color": input.asig_color(),
+            "horas": int(input.asig_horas() or 0),
+        }
+        asig_state.set(asig_state.get() + [nueva])
+        ui.update_text("asig_nombre", value="")
+
+    @reactive.effect
+    @reactive.event(input.asig_remove)
+    def _asig_remove():
+        sel = input.asig_del()
+        if not sel:
+            return
+        asig_state.set([a for a in asig_state.get() if a["id"] != sel])
+        # Las celdas pintadas con esa asignatura vuelven a "Disponible".
+        df = grid_state.get().copy()
+        for d in DIAS:
+            df[d] = ["D" if str(v).strip() == sel else v for v in df[d]]
+        grid_state.set(df)
+        grid_version.set(grid_version.get() + 1)
+
+    @reactive.effect
+    def _sync_asig_del():
+        asigs = asig_state.get()
+        choices = {a["id"]: a["nombre"] for a in asigs}
+        ui.update_select("asig_del", choices=choices)
+
+    @render.ui
+    def lista_asig():
+        asigs = asig_state.get()
+        if not asigs:
+            return ui.HTML(
+                '<div style="font-size:13px;color:#9aa7b3;">Aún no agregas '
+                'asignaturas. Agrega al menos una para pintarla en la grilla.</div>'
+            )
+        chips = []
+        for a in asigs:
+            chips.append(
+                f'<span style="display:inline-flex;align-items:center;gap:6px;'
+                f'background:{a["color"]};color:#fff;padding:5px 10px;border-radius:8px;'
+                f'font-size:12px;font-weight:700;margin:3px;">'
+                f'{html_lib.escape(a["nombre"])} · {int(a.get("horas") or 0)} bloques'
+                f'</span>'
+            )
+        return ui.HTML('<div>' + "".join(chips) + '</div>')
+
+    @render.ui
+    def validacion_asig():
+        asigs = asig_state.get()
+        if not asigs:
+            return ui.HTML("")
+        df = grid_state.get()
+        dur = dur_state.get()
+        n = len(df)
+
+        filas = []
+        for a in asigs:
+            cnt = mins = 0
+            for i in range(n):
+                for d in DIAS:
+                    if str(df.at[i, d]).strip() == a["id"]:
+                        cnt += 1
+                        mins += minutos_celda(df, dur, i, d)
+            objetivo = int(a.get("horas") or 0)
+            falta = objetivo - cnt
+            if falta > 0:
+                estado, col = f"faltan {falta}", "#8a6d00"
+            elif falta < 0:
+                estado, col = f"{-falta} de más", "#b71c1c"
+            else:
+                estado, col = "completo", "#2e7d32"
+            filas.append(
+                f'<div style="display:flex;align-items:center;gap:8px;margin:3px 0;'
+                f'font-size:13px;">'
+                f'<span style="display:inline-block;width:14px;height:14px;'
+                f'border-radius:3px;background:{a["color"]};"></span>'
+                f'<b>{html_lib.escape(a["nombre"])}</b>'
+                f'<span style="color:#5b6b7b;">{cnt}/{objetivo} bloques · '
+                f'{fmt_horas(mins)}</span>'
+                f'<span style="color:{col};font-weight:600;">{estado}</span></div>'
+            )
+        return ui.HTML(
+            '<div style="background:#f8fafc;border:1px solid #e3e8ee;border-radius:10px;'
+            'padding:10px 12px;margin-top:10px;">'
+            '<div style="font-size:12px;color:#7a8a99;text-transform:uppercase;'
+            'letter-spacing:.04em;margin-bottom:4px;">Avance por asignatura</div>'
+            + "".join(filas) + '</div>'
+        )
 
     # --- 3. Optimización --------------------------------------------------
 
@@ -902,7 +1357,9 @@ def server(input, output, session):
         res, _ = data
         with reactive.isolate():
             labels = labels_rv.get()
-        return ui.HTML(grilla_resultado_html(res, labels))
+            mapa = mapa_render(asig_state.get())
+            dur = dur_state.get()
+        return ui.HTML(grilla_resultado_html(res, labels, mapa, dur))
 
     @reactive.effect
     @reactive.event(input.cell_label)
@@ -921,6 +1378,16 @@ def server(input, output, session):
         _, r = data
         return ui.HTML(resumen_html(r))
 
+    @render.ui
+    def tabla_horas():
+        data = resultado_rv.get()
+        if data is None:
+            return ui.HTML("")
+        res, _ = data
+        with reactive.isolate():
+            dur = dur_state.get()
+        return ui.HTML(tabla_horas_html(res, dur))
+
     @render.download(filename="horario.pdf", media_type="application/pdf")
     def descargar_pdf():
         data = resultado_rv.get()
@@ -931,7 +1398,8 @@ def server(input, output, session):
         else:
             res, resumen = data
         labels = labels_rv.get()
-        yield generar_pdf(res, labels, resumen, "Horario semanal")
+        mapa = mapa_render(asig_state.get())
+        yield generar_pdf(res, labels, resumen, mapa, "Horario semanal")
 
 
 app = App(app_ui, server)
