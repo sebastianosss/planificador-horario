@@ -34,6 +34,12 @@ DIAS = ["Lun", "Mar", "Mie", "Jue", "Vie"]
 DIAS_NOMBRE = {"Lun": "Lunes", "Mar": "Martes", "Mie": "Miércoles",
                "Jue": "Jueves", "Vie": "Viernes"}
 
+CICLOS = {"1": "Primer Ciclo", "2": "Segundo Ciclo"}
+DEFAULTS_CICLO = {
+    "1": {"ingreso": "07:55", "salida_alm": "13:00", "regreso": "14:00", "salida": "18:30"},
+    "2": {"ingreso": "08:10", "salida_alm": "13:15", "regreso": "14:00", "salida": "18:30"},
+}
+
 # Código -> (etiqueta, color de fondo, color de texto)
 CATEGORIAS = {
     "L": ("Lectiva",                  "#3b6fb6", "#ffffff"),
@@ -71,8 +77,35 @@ def mapa_render(asignaturas: list) -> dict:
     return m
 
 
-def filas_catalogo():
-    """Fuente única de verdad: (inicio, fin, nombre, es_recreo)."""
+def filas_catalogo(ciclo="1"):
+    """Fuente única de verdad: (inicio, fin, nombre, es_recreo).
+
+    ciclo "1" = Primer Ciclo (ingreso 07:55, almuerzo 13:00-14:00).
+    ciclo "2" = Segundo Ciclo (+15 min, ingreso 08:10, almuerzo 13:15-14:00).
+    La jornada de tarde es idéntica en ambos ciclos.
+    """
+    # Jornada de tarde: igual para ambos ciclos.
+    tarde = [
+        ("14:00", "14:45", "Bloque 7",         False),
+        ("14:45", "15:30", "Bloque 8",         False),
+        ("15:30", "16:30", "Bloque 9",         False),
+        ("16:30", "17:30", "Bloque 10",        False),
+        ("17:30", "18:30", "Bloque 11",        False),
+    ]
+    if ciclo == "2":
+        return [
+            ("08:10", "08:15", "Ingreso / Saludo", False),
+            ("08:15", "09:00", "Bloque 1",         False),
+            ("09:00", "09:45", "Bloque 2",         False),
+            ("09:45", "10:00", "Recreo 1",         True),
+            ("10:00", "10:45", "Bloque 3",         False),
+            ("10:45", "11:30", "Bloque 4",         False),
+            ("11:30", "11:45", "Recreo 2",         True),
+            ("11:45", "12:30", "Bloque 5",         False),
+            ("12:30", "13:15", "Bloque 6",         False),
+            ("13:15", "14:00", "Bloque 6b",        False),
+        ] + tarde
+    # Ciclo 1 (por defecto).
     return [
         ("07:55", "08:00", "Ingreso / Saludo", False),
         ("08:00", "08:45", "Bloque 1",         False),
@@ -84,23 +117,13 @@ def filas_catalogo():
         ("11:30", "12:15", "Bloque 5",         False),
         ("12:15", "13:00", "Bloque 6",         False),
         ("13:00", "14:00", "Bloque 6b",        False),
-        # Jornada de tarde: dos bloques de 45', recreo, dos de 45', recreo,
-        # dos de 45'. (desde el regreso de almuerzo, 14:00)
-        ("14:00", "14:45", "Bloque 7",         False),
-        ("14:45", "15:30", "Bloque 8",         False),
-        ("15:30", "15:45", "Recreo 3",         True),
-        ("15:45", "16:30", "Bloque 9",         False),
-        ("16:30", "17:15", "Bloque 10",        False),
-        ("17:15", "17:30", "Recreo 4",         True),
-        ("17:30", "18:15", "Bloque 11",        False),
-        ("18:15", "19:00", "Bloque 12",        False),
-    ]
+    ] + tarde
 
 
-def opciones_hora():
+def opciones_hora(ciclo="1"):
     """Lista ordenada de horas únicas (límites de bloque) para los selectores."""
     s = set()
-    for ini, fin, _, _ in filas_catalogo():
+    for ini, fin, _, _ in filas_catalogo(ciclo):
         s.add(ini)
         s.add(fin)
     return sorted(s, key=time_to_mins) if s else []
@@ -127,9 +150,9 @@ def fmt_horas(mins):
     return f"{h}h {m:02d}m"
 
 
-def catalogo_vacio() -> pd.DataFrame:
+def catalogo_vacio(ciclo="1") -> pd.DataFrame:
     """DataFrame base con todas las celdas en blanco ('fuera de jornada')."""
-    filas = filas_catalogo()
+    filas = filas_catalogo(ciclo)
     data = {"Inicio": [f[0] for f in filas],
             "Fin": [f[1] for f in filas],
             "Bloque": [f[2] for f in filas]}
@@ -138,13 +161,13 @@ def catalogo_vacio() -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
-def catalogo_vacio_duraciones() -> pd.DataFrame:
+def catalogo_vacio_duraciones(ciclo="1") -> pd.DataFrame:
     """
     Minutos 'efectivos' de cada celda. Por defecto (sin asistente aplicado)
     cada celda vale la duración nominal del bloque; el asistente los recorta
     según el ingreso/salida real del día (ver construir_esqueleto_pure).
     """
-    filas = filas_catalogo()
+    filas = filas_catalogo(ciclo)
     nominal = [time_to_mins(f[1]) - time_to_mins(f[0]) for f in filas]
     data = {"Inicio": [f[0] for f in filas],
             "Fin": [f[1] for f in filas],
@@ -194,7 +217,7 @@ def minutos_celda(df: pd.DataFrame, dur_df: pd.DataFrame, i: int, d: str) -> int
 #  la salida cae a mitad de un bloque, ese bloque se cuenta solo por los
 #  minutos que realmente caen dentro de la jornada, no por el bloque completo.
 
-def construir_esqueleto_pure(horarios_por_dia: dict) -> tuple[pd.DataFrame, pd.DataFrame, list]:
+def construir_esqueleto_pure(horarios_por_dia: dict, ciclo="1") -> tuple[pd.DataFrame, pd.DataFrame, list]:
     """
     horarios_por_dia[d] = {
         "trabaja": bool, "colacion": bool,
@@ -203,9 +226,9 @@ def construir_esqueleto_pure(horarios_por_dia: dict) -> tuple[pd.DataFrame, pd.D
     }
     Devuelve (df_codigos, df_duraciones_minutos, lista_de_errores).
     """
-    filas = filas_catalogo()
-    df = catalogo_vacio()
-    dur = catalogo_vacio()  # mismo esqueleto de columnas; se llenará con minutos (no códigos)
+    filas = filas_catalogo(ciclo)
+    df = catalogo_vacio(ciclo)
+    dur = catalogo_vacio(ciclo)  # mismo esqueleto de columnas; se llenará con minutos (no códigos)
     for d in DIAS:
         dur[d] = [0 for _ in filas]
     errores = []
@@ -1037,6 +1060,13 @@ INSTRUCCIONES_PASO3 = ui.HTML(
 app_ui = ui.page_sidebar(
     ui.sidebar(
         ui.h5("Configuración"),
+        ui.input_radio_buttons("ciclo", "Ciclo de horarios",
+                               CICLOS, selected="1", inline=True),
+        ui.HTML(
+            '<div style="font-size:11px;color:#7a8a99;margin:-6px 0 2px 0;">'
+            'Primer Ciclo: ingreso 07:55 — Segundo Ciclo: ingreso 08:10</div>'
+        ),
+        ui.hr(),
         ui.input_numeric("horas", "Horas de contrato (semanales)",
                          value=36, min=1, max=44, step=1),
         ui.hr(),
@@ -1132,6 +1162,26 @@ def server(input, output, session):
     asig_state = reactive.value([])                 # asignaturas: {id, nombre, color, horas}
     asig_counter = reactive.value(0)                # correlativo para los ids S#
 
+    # --- 0. Cambio de ciclo ---------------------------------------------------
+
+    @reactive.effect
+    @reactive.event(input.ciclo)
+    def _cambiar_ciclo():
+        ciclo = input.ciclo()
+        grid_state.set(catalogo_vacio(ciclo))
+        dur_state.set(catalogo_vacio_duraciones(ciclo))
+        grid_version.set(grid_version.get() + 1)
+        labels_rv.set({})
+        resultado_rv.set(None)
+        errores_rv.set([])
+        # Actualiza los valores por defecto de los campos de hora.
+        defaults = DEFAULTS_CICLO[ciclo]
+        for d in DIAS:
+            ui.update_text(f"ingreso_{d}", value=defaults["ingreso"])
+            ui.update_text(f"salida_alm_{d}", value=defaults["salida_alm"])
+            ui.update_text(f"regreso_{d}", value=defaults["regreso"])
+            ui.update_text(f"salida_{d}", value=defaults["salida"])
+
     # --- 1. Asistente de horario por contrato -------------------------------
 
     @reactive.effect
@@ -1157,6 +1207,7 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.aplicar)
     def _aplicar_horario():
+        ciclo = input.ciclo()
         horarios = {}
         for d in DIAS:
             horarios[d] = {
@@ -1167,7 +1218,7 @@ def server(input, output, session):
                 "regreso": input[f"regreso_{d}"](),
                 "salida": input[f"salida_{d}"](),
             }
-        df, dur, errores = construir_esqueleto_pure(horarios)
+        df, dur, errores = construir_esqueleto_pure(horarios, ciclo)
         # Preserva lo ya pintado (clases/no lectiva/asignaturas) donde siga
         # habiendo tiempo de trabajo: corregir un día no borra la semana.
         df = fusionar_pintura(df, grid_state.get())
@@ -1193,8 +1244,9 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.reset)
     def _reset():
-        grid_state.set(catalogo_vacio())
-        dur_state.set(catalogo_vacio_duraciones())
+        ciclo = input.ciclo()
+        grid_state.set(catalogo_vacio(ciclo))
+        dur_state.set(catalogo_vacio_duraciones(ciclo))
         grid_version.set(grid_version.get() + 1)
         labels_rv.set({})
         resultado_rv.set(None)
@@ -1392,8 +1444,9 @@ def server(input, output, session):
     def descargar_pdf():
         data = resultado_rv.get()
         if data is None:
-            df_vacio = catalogo_vacio()
-            dur_vacio = catalogo_vacio_duraciones()
+            ciclo = input.ciclo()
+            df_vacio = catalogo_vacio(ciclo)
+            dur_vacio = catalogo_vacio_duraciones(ciclo)
             res, resumen = optimizar(df_vacio, dur_vacio, input.horas())
         else:
             res, resumen = data

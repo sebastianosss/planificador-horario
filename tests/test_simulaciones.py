@@ -23,8 +23,9 @@ IDX = {nombre: i for i, (_, _, nombre, _) in enumerate(filas_catalogo())}
 def semana_completa():
     """5 días de 08:00-13:00 y 14:00-16:30 con colación 13:00-14:00.
 
-    Por día: 9 bloques Disponibles de 45' (405 min) + 3 recreos de 15' (45 min)
-    + colación de 60' (no suma). Capacidad semanal: 2025 min D + 225 min R.
+    Por día: 8 bloques de 45' + 1 de 60' (Bloque 9) = 9 bloques (420 min)
+    + 2 recreos de 15' (30 min) + colación 60' (no suma).
+    Capacidad semanal: 2100 min D + 150 min R.
     """
     cfg = {"trabaja": True, "colacion": True, "ingreso": "08:00",
            "salida_alm": "13:00", "regreso": "14:00", "salida": "16:30"}
@@ -58,9 +59,9 @@ class TestSimulacionSemanaCompleta:
         assert r["status"] == "ok"
         assert r["lectiva"] == 10 * 45          # 450: S1 (6) + S2 (4)
         assert r["nolectiva"] == 2 * 45         # 90: las dos reuniones
-        assert r["recreo"] == 5 * 45            # 225: 3 recreos de 15' x 5 días
-        # fijo = 765; la preparación completa exactamente el contrato.
-        assert r["prep"] == 1800 - 765          # 1035 = 23 bloques de 45'
+        assert r["recreo"] == 5 * 30            # 150: 2 recreos de 15' x 5 días
+        # fijo = 690; la preparación completa exactamente el contrato.
+        assert r["prep"] == 1800 - 690          # 1110
         assert r["total"] == 1800
         assert r["deficit"] == 0
         # Proporción legal: 25% lectiva, muy bajo el tope de 65%.
@@ -72,11 +73,12 @@ class TestSimulacionSemanaCompleta:
         # resumen debe advertirlo como error.
         df, dur = self._armar()
         _, r = optimizar(df, dur, horas_contrato=30)
-        assert r["disponible"] == 33 * 45       # 1485: bloques D no pintados
-        assert r["sobrante"] == 450             # 1485 - 1035 de preparación
-        assert r["sobrante_bloques"] == 10
+        # 33 bloques D: 28 de 45' + 5 de 60' = 1560 min
+        assert r["disponible"] == 1560
+        assert r["sobrante"] == 450             # 1560 - 1110 de preparación
+        assert r["sobrante_bloques"] == 9
         html = resumen_html(r)
-        assert "10 bloques Disponibles" in html
+        assert "9 bloques Disponibles" in html
         assert fmt_horas(450) in html           # "7h 30m"
         assert "sin asignar" in html
 
@@ -87,7 +89,7 @@ class TestSimulacionSemanaCompleta:
 
         assert sum(des["L"].values()) == r["lectiva"]
         assert sum(des["N"].values()) == r["nolectiva"]
-        assert sum(des["P"].values()) == r["prep"]
+        assert sum(des["P"].values()) == r["prep"]  # 1110
         assert sum(des["R"].values()) == r["recreo"]
         # El total del desglose es el mismo total trabajado del resumen.
         total_desglose = sum(sum(des[c].values()) for c in ("L", "N", "P", "R"))
@@ -102,9 +104,10 @@ class TestSimulacionSemanaCompleta:
         prep = bloques_preparacion(res, dur)
 
         # La lista reporta exactamente los bloques P y su aporte suma el resumen.
-        assert len(prep) == 23
-        assert sum(p["min"] for p in prep) == r["prep"] == 1035
-        assert all(p["min"] == 45 for p in prep)
+        assert len(prep) == 24
+        assert sum(p["min"] for p in prep) == r["prep"] == 1110
+        # Bloques de 45' y 60' (Bloque 9 = 60' en la nueva campanada).
+        assert all(p["min"] in (45, 60) for p in prep)
         # Cada bloque nuevo quedó donde antes había un Disponible.
         for p in prep:
             fila = [i for i, (_, _, nom, _) in enumerate(filas_catalogo())
@@ -121,8 +124,8 @@ class TestSimulacionSemanaCompleta:
 
         assert "Suma de horas por día" in html
         assert "Bloques nuevos de preparación" in html
-        assert "Total: 23 bloques nuevos" in html
-        assert fmt_horas(1035) in html           # "17h 15m"
+        assert "Total: 24 bloques nuevos" in html
+        assert fmt_horas(1110) in html           # "18h 30m"
         assert fmt_horas(r["total"]) in html     # total trabajado semanal
         # El detalle va plegado por defecto en un <details> desplegable.
         assert html.lstrip().startswith("<details")

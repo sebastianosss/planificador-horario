@@ -94,9 +94,9 @@ class TestConstruirEsqueleto:
         # La colación 13:00-14:00 cae completa en el Bloque 6b.
         assert df.at[IDX["Bloque 6b"], "Lun"] == "C"
         assert dur.at[IDX["Bloque 6b"], "Lun"] == 60
-        # Salida 18:30: el Bloque 12 (18:15-19:00) aporta solo 15 min.
-        assert df.at[IDX["Bloque 12"], "Lun"] == "D"
-        assert dur.at[IDX["Bloque 12"], "Lun"] == 15
+        # Salida 18:30: el Bloque 11 (17:30-18:30) cubre justo hasta la salida.
+        assert df.at[IDX["Bloque 11"], "Lun"] == "D"
+        assert dur.at[IDX["Bloque 11"], "Lun"] == 60
 
     def test_salida_a_mitad_de_bloque(self):
         df, dur, errores = construir_esqueleto_pure(solo_lunes(salida="14:15"))
@@ -306,3 +306,74 @@ def test_generar_pdf_produce_un_pdf():
     pdf = generar_pdf(res, labels, resumen, mapa)
     assert pdf[:5] == b"%PDF-"
     assert len(pdf) > 1000
+
+
+# -----------------------------------------------------------------------------
+# Segundo Ciclo (ciclo="2")
+# -----------------------------------------------------------------------------
+
+# Índice de fila por nombre de bloque para el segundo ciclo.
+IDX2 = {nombre: i for i, (_, _, nombre, _) in enumerate(filas_catalogo(ciclo="2"))}
+
+
+def dia_cfg_c2(**kw):
+    """Config de un día de trabajo estándar del segundo ciclo."""
+    base = {"trabaja": True, "colacion": True, "ingreso": "08:10",
+            "salida_alm": "13:15", "regreso": "14:00", "salida": "18:30"}
+    base.update(kw)
+    return base
+
+
+def solo_lunes_c2(**kw):
+    horarios = {d: {"trabaja": False} for d in DIAS}
+    horarios["Lun"] = dia_cfg_c2(**kw)
+    return horarios
+
+
+class TestSegundoCiclo:
+    """Verifica que la lógica funcione correctamente con ciclo='2'."""
+
+    def test_catalogo_segundo_ciclo_tiene_mismos_bloques(self):
+        """Ambos ciclos tienen los mismos nombres de bloque (misma cantidad)."""
+        filas1 = filas_catalogo(ciclo="1")
+        filas2 = filas_catalogo(ciclo="2")
+        assert len(filas1) == len(filas2)
+        nombres1 = [f[2] for f in filas1]
+        nombres2 = [f[2] for f in filas2]
+        assert nombres1 == nombres2
+
+    def test_tarde_identica(self):
+        """Los bloques de la tarde (14:00 en adelante) son iguales."""
+        filas1 = filas_catalogo(ciclo="1")
+        filas2 = filas_catalogo(ciclo="2")
+        tarde1 = [(i, f) for i, f in filas1 if time_to_mins(f[0]) >= 840]
+        tarde2 = [(i, f) for i, f in filas2 if time_to_mins(f[0]) >= 840]
+        assert tarde1 == tarde2
+
+    def test_esqueleto_segundo_ciclo(self):
+        df, dur, errores = construir_esqueleto_pure(solo_lunes_c2(), ciclo="2")
+        assert errores == []
+        # Ingreso 08:10: el saludo (08:10-08:15) aporta 5 min.
+        assert df.at[IDX2["Ingreso / Saludo"], "Lun"] == "D"
+        assert dur.at[IDX2["Ingreso / Saludo"], "Lun"] == 5
+        # Bloque 1 (08:15-09:00) completo.
+        assert df.at[IDX2["Bloque 1"], "Lun"] == "D"
+        assert dur.at[IDX2["Bloque 1"], "Lun"] == 45
+        # Recreo 1 (09:45-10:00) = 15 min.
+        assert df.at[IDX2["Recreo 1"], "Lun"] == "R"
+        assert dur.at[IDX2["Recreo 1"], "Lun"] == 15
+        # Colación 13:15-14:00 cae en Bloque 6b.
+        assert df.at[IDX2["Bloque 6b"], "Lun"] == "C"
+        assert dur.at[IDX2["Bloque 6b"], "Lun"] == 45
+        # El Bloque 11 cubre hasta 18:30, igual que ciclo 1.
+        assert df.at[IDX2["Bloque 11"], "Lun"] == "D"
+        assert dur.at[IDX2["Bloque 11"], "Lun"] == 60
+
+    def test_optimizador_segundo_ciclo(self):
+        horarios = solo_lunes_c2(colacion=False, ingreso="08:15", salida="13:15")
+        df, dur, _ = construir_esqueleto_pure(horarios, ciclo="2")
+        df.at[IDX2["Bloque 1"], "Lun"] = "L"
+        res, r = optimizar(df, dur, horas_contrato=5)
+        assert r["status"] == "ok"
+        assert r["lectiva"] == 45
+        assert r["total"] <= 300

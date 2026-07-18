@@ -34,7 +34,7 @@ de permanencia en el establecimiento.
 
 ## 2. Cómo está construida
 
-Toda la app vive en **un solo archivo**, [`app.py`](app.py) (~1.240 líneas), organizado en 11
+Toda la app vive en **un solo archivo**, [`app.py`](app.py) (~1.260 líneas), organizado en 11
 secciones numeradas con comentarios. Separa con bastante disciplina la **lógica pura**
 (funciones testeables sin Shiny) de la **capa reactiva** (server).
 
@@ -82,8 +82,9 @@ app.py
 - **El optimizador solo asigna Preparación.** Por decisión de producto, la colocación de
   asignaturas es manual (el usuario pinta); el LP maximiza minutos de preparación con un
   desempate que prefiere bloques entre clases ya fijadas (`es_interior`).
-- **La campanada es fija** (`filas_catalogo()`): jornada 07:55–19:00, bloques de 45', recreos
-  de 15', un bloque 6b de 60' (13:00–14:00) y jornada de tarde 14:00–19:00.
+- **La campanada es fija** (`filas_catalogo()`): jornada 07:55–18:30, bloques de 45' por la
+  mañana con recreos de 15', un bloque 6b de 60' (13:00–14:00) y jornada de tarde 14:00–18:30
+  (dos bloques de 45' seguidos sin recreo, luego tres bloques de 60').
 - El HTML de grillas, paleta, leyenda y resumen se genera **a mano como strings** con estilos
   inline (no se usan componentes de Shiny para esas partes).
 
@@ -171,7 +172,7 @@ actividades, e imprimir/compartir el PDF.
   o si el servidor de Posit recicla la sesión, se pierde todo el trabajo. No hay
   guardar/cargar (ni archivo, ni URL, ni base de datos). Es la limitación más importante para
   un usuario real.
-- **Campanada fija.** Los bloques y recreos (07:55–19:00) están escritos en el código
+- **Campanada fija.** Los bloques y recreos (07:55–18:30) están escritos en el código
   (`filas_catalogo()`). Un colegio con otra estructura de bloques no puede adaptarla desde la
   UI; solo puede aproximarla con las horas de ingreso/salida.
 - **Un docente, una semana tipo.** No hay semanas alternadas (A/B), ni múltiples docentes, ni
@@ -193,7 +194,7 @@ actividades, e imprimir/compartir el PDF.
   imprimirse mal en B/N.
 
 ### Técnicas / de mantenimiento
-- **Monolito de un archivo.** UI, lógica, HTML/JS embebido y PDF en un solo `app.py` de ~1.240
+- **Monolito de un archivo.** UI, lógica, HTML/JS embebido y PDF en un solo `app.py` de ~1.260
   líneas. Funciona, pero dificulta hacer crecer la app (candidato natural a separar
   en módulos: `core/` puro, `ui/`, `pdf.py`).
 - **Cobertura de tests parcial.** `tests/test_logic.py` cubre la lógica pura (esqueleto,
