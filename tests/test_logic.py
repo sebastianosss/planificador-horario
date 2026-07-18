@@ -346,8 +346,8 @@ class TestSegundoCiclo:
         """Los bloques de la tarde (14:00 en adelante) son iguales."""
         filas1 = filas_catalogo(ciclo="1")
         filas2 = filas_catalogo(ciclo="2")
-        tarde1 = [(i, f) for i, f in filas1 if time_to_mins(f[0]) >= 840]
-        tarde2 = [(i, f) for i, f in filas2 if time_to_mins(f[0]) >= 840]
+        tarde1 = [(i, f) for i, f in enumerate(filas1) if time_to_mins(f[0]) >= 840]
+        tarde2 = [(i, f) for i, f in enumerate(filas2) if time_to_mins(f[0]) >= 840]
         assert tarde1 == tarde2
 
     def test_esqueleto_segundo_ciclo(self):
